@@ -1,0 +1,475 @@
+local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
+local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
+local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
+local Options, Toggles = Library.Options, Library.Toggles
+
+local Players = game:GetService("Players")
+local TextChatService = game:GetService("TextChatService")
+local Main = Players.LocalPlayer:WaitForChild("PlayerGui"):WaitForChild("Main")
+local env = getsenv(Main:WaitForChild("Game"))
+
+local function inRound()
+	return env.gameActive or env.tutorialActive
+end
+
+-- upvalues of spawnAnomalyLoop: 8 = active anomalies, 9 = seconds until each one moves
+-- the tutorial keeps its own global table and has no timers
+local function anomalies()
+	if env.tutorialActive then return env.tutorialActiveAnomalies or {}, {} end
+	return debug.getupvalue(env.spawnAnomalyLoop, 8) or {}, debug.getupvalue(env.spawnAnomalyLoop, 9) or {}
+end
+
+local function roomName(key)
+	local texts = env.roomTexts and env.roomTexts[env.currentChapter]
+	return texts and texts[key] or key
+end
+
+local function buttons(frame)
+	local t = {}
+	for _, b in ipairs(frame:GetChildren()) do
+		if b:IsA("GuiButton") and b.Name ~= "Template" and b.Name ~= "Global" and b.Name ~= "Area" then t[#t + 1] = b end
+	end
+	return t
+end
+
+local function label(b)
+	local l = b:FindFirstChildOfClass("TextLabel")
+	return l and l.Text
+end
+
+local function logButton(kind)
+	for _, b in ipairs(buttons(Main.AnomalyLog)) do
+		if label(b) == kind then return b end
+	end
+end
+
+local function waitIdle(timeout)
+	local t = os.clock() + (timeout or 10)
+	while (env.isReporting or env.isTransitioning) and os.clock() < t do task.wait(0.1) end
+	return not (env.isReporting or env.isTransitioning)
+end
+
+-- selected room's label turns white (see onRoomButtonActivated)
+local function isSelected(btn)
+	local l = btn:FindFirstChildOfClass("TextLabel")
+	return l and l.TextColor3 == Color3.new(1, 1, 1)
+end
+
+local function currentRoom()
+	for _, b in ipairs(buttons(Main.Rooms)) do
+		if isSelected(b) then return b.Name end
+	end
+end
+
+local busy = false
+local function report(room, kind)
+	if busy or not inRound() then return end
+	busy = true
+	local ok, err = pcall(function()
+		local roomBtn, btn = Main.Rooms:FindFirstChild(room), logButton(kind)
+		if not (roomBtn and btn) or not waitIdle() then return end
+		if not isSelected(roomBtn) then
+			firesignal(roomBtn.Activated)
+			task.wait(0.2)
+			if not waitIdle() or not isSelected(roomBtn) then return end
+		end
+		if anomalies()[room] ~= kind then return end -- moved while we were switching
+		firesignal(btn.Activated)
+		waitIdle(15)
+	end)
+	if not ok then warn("[Eternal] report failed:", err) end
+	busy = false
+end
+
+-- chat
+local whisperChannels = {}
+local function whisperChannel(plr)
+	local ch = whisperChannels[plr.UserId]
+	if ch and ch.Parent then return ch end
+	ch = game:GetService("RobloxReplicatedStorage").ExperienceChat.WhisperChat:InvokeServer(plr.UserId)
+	whisperChannels[plr.UserId] = ch
+	return ch
+end
+
+local function announce(room, kind, timeLeft)
+	local vars = { anomaly = kind, report = kind, room = roomName(room), time = tostring(timeLeft or 0) }
+	local msg = Options.AnnounceText.Value:gsub("{(%w+)}", vars)
+	if Toggles.AnnouncePublic.Value then
+		task.spawn(pcall, function() TextChatService.TextChannels.RBXGeneral:SendAsync(msg) end)
+	end
+	for plr, on in pairs(Options.AnnounceWhisper.Value) do
+		plr = typeof(plr) == "Instance" and plr or Players:FindFirstChild(tostring(plr))
+		if on and plr and plr.Parent then
+			task.spawn(function()
+				local ok, err = pcall(function() whisperChannel(plr):SendAsync(msg) end)
+				if not ok then warn("[Eternal] whisper to", plr.Name, "failed:", err) end
+			end)
+		end
+	end
+end
+
+-- badges: per chapter {clear, veteran, journal}
+local BADGES = {
+	{ 730424518350441, 2279310547665446, 2347833876267561 },
+	{ 4262707316592959, 1113443419840554, 2974723314672545 },
+	{ 3523258363992770, 1963641952504328, 4406031228014596 },
+	{ 912853742920620, 1345085336933549, 3233876184896346 },
+	{ 3478437499878632, 80836062530259, 3255646258119751 },
+}
+local TUTORIAL_BADGE = 4335448027099664
+local BadgeService = game:GetService("BadgeService")
+local ownedBadge = {} -- only caches true, so fresh awards get picked up
+local function hasBadge(id)
+	if not ownedBadge[id] then
+		local ok, has = pcall(BadgeService.UserHasBadgeAsync, BadgeService, Players.LocalPlayer.UserId, id)
+		ownedBadge[id] = ok and has or nil
+	end
+	return ownedBadge[id] == true
+end
+
+-- journal UI keeps a Placeholder entry per uncaptured combo (name ends in the image id for variant types)
+local journalList = Main.JournalFrame.CanvasGroup.ScrollingFrame2
+local function journalMissing(ch)
+	local missing, total = {}, 0
+	for _, e in ipairs(journalList:GetChildren()) do
+		if e:IsA("GuiButton") and e:GetAttribute("Chapter") == ch then
+			total += 1
+			if e:GetAttribute("Placeholder") then missing[#missing + 1] = e end
+		end
+	end
+	return missing, total
+end
+
+local function badgeStatus()
+	local lines = { "Tutorial " .. (hasBadge(TUTORIAL_BADGE) and "✓" or "✗") }
+	for ch, ids in ipairs(BADGES) do
+		local missing, total = journalMissing(ch)
+		lines[ch + 1] = string.format("Ch%d  clear %s  veteran %s  journal %d/%d %s", ch,
+			hasBadge(ids[1]) and "✓" or "✗", hasBadge(ids[2]) and "✓" or "✗",
+			total - #missing, total, hasBadge(ids[3]) and "✓" or "✗")
+	end
+	return table.concat(lines, "\n")
+end
+
+-- put one missing journal combo into an open room when nothing is active; auto report captures it
+-- the server keeps at most <shift anomaly total> new journal captures per shift and silently drops the rest
+local lastFill, shiftMissing = 0, nil
+local function fillJournal()
+	local active, timers = anomalies()
+	local ch = env.currentChapter
+	local missing = journalMissing(ch)
+	shiftMissing = shiftMissing or #missing
+	-- upvalue 3 of beginRoundIntro = chapter table; TotalAnomalies already includes Veteran/shift bonuses
+	local cap = debug.getupvalue(env.beginRoundIntro, 3)[ch].TotalAnomalies or 0
+	-- every active uncaptured combo takes a slot when reported; past the cap it would be marked locally
+	-- but dropped by the server, so swap it to a type this room has fully captured
+	local used = shiftMissing - #missing
+	local pending = {}
+	for _, e in ipairs(missing) do pending[e:GetAttribute("RoomKey") .. "|" .. e:GetAttribute("PendingType")] = true end
+	for room, kind in pairs(active) do
+		if pending[room .. "|" .. kind] then
+			if used < cap then
+				used += 1
+			else
+				for other, img in pairs(env.roomImages[ch][room]) do
+					if type(img) ~= "number" and img ~= "" and other ~= "Normal" and other ~= "Requirement" and not pending[room .. "|" .. other] then
+						active[room] = other
+						break
+					end
+				end
+			end
+		end
+	end
+	if used >= cap or next(active) or busy or os.clock() - lastFill < 12 then return end
+	for _, e in ipairs(missing) do
+		local room, kind = e:GetAttribute("RoomKey"), e:GetAttribute("PendingType")
+		local btn = Main.Rooms:FindFirstChild(room)
+		if btn and btn.Visible then
+			local img = e.Name:match("_(rbxassetid://%d+)$")
+			if img then
+				env.anomalyImageVariantCache[room] = img
+				env.anomalyImageVariantKey[room] = ch .. "_" .. kind
+			end
+			active[room], timers[room] = kind, 120
+			lastFill = os.clock()
+			return
+		end
+	end
+end
+
+-- tutorial: Settings > Replay Tutorial needs a confirm click; 4 finds in 3 rooms completes it
+local tutorialRun, tutorialStartedAt -- tutorialRun: nil | "starting" | "running"
+local function startTutorial()
+	if inRound() or tutorialRun then return end
+	tutorialRun, tutorialStartedAt = "starting", os.clock()
+	local btn = Main.SettingsFrame.Tutorial
+	firesignal(btn.Activated)
+	task.wait(0.6) -- button has a 0.5s cooldown
+	firesignal(btn.Activated)
+end
+
+local function fillTutorial()
+	local active = anomalies()
+	if next(active) or busy or os.clock() - lastFill < 3 then return end
+	local here, rooms = currentRoom(), {}
+	for _, b in ipairs(buttons(Main.Rooms)) do
+		if b.Visible and b.Name ~= here then rooms[#rooms + 1] = b.Name end
+	end
+	local room = rooms[math.random(#rooms)]
+	local kinds = {}
+	for kind, img in pairs(room and env.roomImages[0][room] or {}) do
+		if type(img) ~= "number" and img ~= "" and kind ~= "Normal" and kind ~= "Requirement" then kinds[#kinds + 1] = kind end
+	end
+	if #kinds > 0 then
+		active[room] = kinds[math.random(#kinds)]
+		lastFill = os.clock()
+	end
+end
+
+-- button tint (BackgroundColor3 is under the game's UIGradient, hover only touches the gradient)
+local origColor = {}
+local function tint(btn, color)
+	origColor[btn] = origColor[btn] or btn.BackgroundColor3
+	btn.BackgroundColor3 = color or origColor[btn]
+end
+
+-- gamepass flags the client trusts
+local passes = { UnlimitedFails = "hasUnlimitedFails", FasterSearches = "hasFasterSearches", AllChapters = "hasAllChapters" }
+local ownedPass = {}
+for idx, var in pairs(passes) do ownedPass[idx] = env[var] end
+
+-- UI
+local ok, executorName = pcall(identifyexecutor) -- returns name, version; only the name is shown
+if not ok or type(executorName) ~= "string" then executorName = "Unknown executor" end
+
+local Window = Library:CreateWindow({
+	Title = "Eternal",
+	Icon = "cat",
+	Footer = "Anomaly Detected | " .. executorName,
+	NotifySide = "Right",
+	ShowCustomCursor = true,
+})
+local Tabs = {
+	Main = Window:AddTab("Main", "eye"),
+	Chat = Window:AddTab("Chat", "message-square"),
+	Guide = Window:AddTab("Guide", "book-open"),
+	["UI Settings"] = Window:AddTab("UI Settings", "settings"),
+}
+
+local Esp = Tabs.Main:AddLeftGroupbox("Anomalies", "scan-eye")
+Esp:AddLabel("Not in a shift.", true, "AnomalyList")
+Esp:AddToggle("NotifySpawn", { Text = "Notify on new anomaly", Default = true })
+Esp:AddToggle("HighlightRoom", { Text = "Highlight anomaly rooms", Default = true })
+	:AddColorPicker("HighlightColor", { Default = Color3.fromRGB(255, 0, 0), Title = "Highlight color" })
+Esp:AddToggle("HighlightReport", { Text = "Highlight correct report", Default = true, Tooltip = "For the room you're viewing" })
+
+local Auto = Tabs.Main:AddRightGroupbox("Automation", "bot")
+Auto:AddToggle("AutoReport", { Text = "Auto report", Default = false, Tooltip = "Switches to the room and files the correct report" })
+Auto:AddSlider("ReportDelay", { Text = "Wait before reporting (s)", Default = 5, Min = 0, Max = 60, Rounding = 0 })
+Auto:AddButton({ Text = "Report all now", Func = function()
+	task.spawn(function()
+		for room, kind in pairs(table.clone((anomalies()))) do report(room, kind) end
+	end)
+end })
+Auto:AddDivider()
+Auto:AddToggle("AutoFarm", { Text = "Auto start shifts", Default = false, Tooltip = "Starts the selected chapter from the lobby / results screen. Pair with Auto report." })
+Auto:AddDropdown("FarmDifficulty", { Text = "Difficulty", Values = { "Easy", "Normal", "Hard", "Veteran" }, Default = "Normal" })
+
+local Badges = Tabs.Main:AddLeftGroupbox("Badges", "award")
+Badges:AddLabel("Loading...", true, "BadgeStatus")
+Badges:AddToggle("JournalFill", { Text = "Journal filler", Default = false, Tooltip = "Spawns missing journal anomalies of the current chapter. Needs Auto report. Play Veteran so every room is open." })
+Badges:AddToggle("BadgeHunter", { Text = "Badge hunter", Default = false, Tooltip = "Tutorial, then chapters 1-5: Easy for the clear badge, then Veteran + journal filler. Runs auto start/report itself." })
+Badges:AddButton({ Text = "Play tutorial", Func = function() task.spawn(startTutorial) end,
+	Tooltip = "Starts the tutorial from the lobby and completes it" })
+Badges:AddButton({ Text = "Refresh status", Func = function() task.spawn(function() Library.Labels.BadgeStatus:SetText(badgeStatus()) end) end })
+
+local Pass = Tabs.Main:AddRightGroupbox("Gamepasses (client-side)", "ticket")
+Pass:AddToggle("UnlimitedFails", { Text = "Unlimited fails", Default = false, Risky = true })
+Pass:AddToggle("FasterSearches", { Text = "Faster searches", Default = false, Risky = true, Tooltip = "Halves the report / scan animation" })
+Pass:AddToggle("AllChapters", { Text = "All chapters", Default = false, Risky = true, Tooltip = "Re-select the chapter after enabling. Server may not pay out for locked chapters." })
+for idx, var in pairs(passes) do
+	Toggles[idx]:OnChanged(function(v) env[var] = v or ownedPass[idx] end)
+end
+
+local ChatBox = Tabs.Chat:AddLeftGroupbox("Announce anomalies", "megaphone")
+ChatBox:AddToggle("Announce", { Text = "Announce new anomalies", Default = false })
+ChatBox:AddInput("AnnounceText", {
+	Text = "Message",
+	Default = "{anomaly} in {room}, report as {report}",
+	Placeholder = "{anomaly} {room} {report} {time}",
+	ClearTextOnFocus = false,
+})
+ChatBox:AddLabel("Tags: {anomaly} {room} {report} {time}", true)
+ChatBox:AddToggle("AnnouncePublic", { Text = "Send in public chat", Default = true })
+ChatBox:AddDropdown("AnnounceWhisper", { Text = "Whisper to", SpecialType = "Player", ExcludeLocalPlayer = true, Multi = true })
+ChatBox:AddButton({ Text = "Announce current anomalies", Func = function()
+	local active, timers = anomalies()
+	for room, kind in pairs(active) do announce(room, kind, timers[room]) end
+end })
+
+-- guide
+local function section(box, lines)
+	for _, line in ipairs(lines) do box:AddLabel(line, true) end
+end
+
+section(Tabs.Guide:AddLeftGroupbox("Getting started", "cat"), {
+	"RightShift opens / closes this menu (change it in UI Settings).",
+	"Built and tested for solo play; co-op is untested.",
+	"Quickest route: Main > Badges > Badge hunter. It plays the tutorial and every chapter by itself.",
+})
+section(Tabs.Guide:AddLeftGroupbox("Anomalies", "scan-eye"), {
+	"The list shows every active anomaly: room, type, and seconds before it moves to another room.",
+	"Highlight anomaly rooms tints room buttons that hold an anomaly (color picker next to it).",
+	"Highlight correct report tints the right Anomaly Log button for the room you're viewing.",
+	"Notify pops a notification whenever a new anomaly appears.",
+})
+section(Tabs.Guide:AddLeftGroupbox("Chat", "message-square"), {
+	"Announce posts each new anomaly once using your message template.",
+	"Tags: {anomaly} / {report} = anomaly type, {room} = room name, {time} = seconds before it moves.",
+	"Send in public chat and Whisper to (pick one or more players) can be used together.",
+})
+section(Tabs.Guide:AddRightGroupbox("Automation", "bot"), {
+	"Auto report switches to the room and files the right report, so it never costs a fail.",
+	"Wait before reporting delays each report by N seconds after the anomaly appears.",
+	"Auto start shifts starts the selected chapter at the chosen difficulty from the lobby or results screen, skips the 'press any key' text and declines the paid review prompt. Pair it with Auto report.",
+})
+section(Tabs.Guide:AddRightGroupbox("Badges", "award"), {
+	"Badge hunter: tutorial first, then each chapter in order - Easy for the clear badge, Veteran (needs 100%) for the Veteran badge while the journal filler logs missing anomalies. Chapters you've finished are skipped.",
+	"Journal filler spawns anomalies you haven't logged yet. The server only keeps as many new journal entries per shift as the shift's anomaly total (15 on Veteran), so Eternal stops there and continues next shift.",
+	"If a journal shows 100% but its badge never arrives, rejoin: the server resends your real journal and Badge hunter picks up what's missing.",
+	"Play tutorial runs and completes the tutorial on its own.",
+})
+section(Tabs.Guide:AddRightGroupbox("Gamepasses", "ticket"), {
+	"These toggle the game's own pass flags on your client only. Unlimited fails and Faster searches affect your shift; All chapters lets you open locked chapters (re-select the chapter after enabling), but the server may not reward them.",
+})
+
+-- badge hunter: pick the first unfinished chapter + difficulty; true when ready to press Start
+local triedTutorial = false
+local function hunterPrepare()
+	Library.Labels.BadgeStatus:SetText(badgeStatus())
+	if not triedTutorial and not hasBadge(TUTORIAL_BADGE) then
+		triedTutorial = true -- once per load, in case the server doesn't grant it
+		task.spawn(startTutorial)
+		return false
+	end
+	local ownsClear = debug.getupvalue(env.isChapterUnlocked, 2) -- game's own cache, gates Veteran + next chapter
+	for ch, ids in ipairs(BADGES) do
+		local clear = hasBadge(ids[1])
+		if clear then ownsClear[ch] = true end
+		local missing, total = journalMissing(ch)
+		-- full journal counts as done even without the badge (server grants it on its own terms)
+		if not (clear and hasBadge(ids[2]) and (hasBadge(ids[3]) or (total > 0 and #missing == 0))) then
+			if env.currentChapter ~= ch then
+				local nav = Main.Chapters:FindFirstChild(env.currentChapter < ch and "Next" or "Previous")
+				if nav then firesignal(nav.Activated) end
+				return false
+			end
+			Options.FarmDifficulty:SetValue(clear and "Veteran" or "Easy")
+			-- Start label is only recomputed on chapter change; fix it if we just marked the previous clear as owned
+			local l = Main.Start:FindFirstChildOfClass("TextLabel")
+			if l and l.Text == "Unlock" and env.isChapterUnlocked(ch) then l.Text = "Start" end
+			return true
+		end
+	end
+	Toggles.BadgeHunter:SetValue(false)
+	Library:Notify({ Title = "Badge hunter", Description = "All chapter badges owned.", Time = 8 })
+	return false
+end
+task.spawn(function() Library.Labels.BadgeStatus:SetText(badgeStatus()) end)
+
+-- main loop
+local seen = {} -- "room|type" -> first seen clock
+local nextStart = 0
+task.spawn(function()
+	while not Library.Unloaded do
+		for idx, var in pairs(passes) do
+			if Toggles[idx].Value then env[var] = true end
+		end
+
+		local hunting = Toggles.BadgeHunter.Value
+		if tutorialRun == "starting" and env.tutorialActive then tutorialRun = "running" end
+		if tutorialRun == "starting" and os.clock() - tutorialStartedAt > 30 then tutorialRun = nil end -- never started (e.g. in a party)
+		if tutorialRun == "running" and not env.tutorialActive then tutorialRun = nil end
+		if tutorialRun == "running" and Main.Rooms.Visible and not env.isReporting then fillTutorial() end
+		if not env.gameActive then shiftMissing = nil end
+		if env.gameActive and Main.Rooms.Visible and not env.isReporting and (Toggles.JournalFill.Value or hunting) then
+			fillJournal()
+		end
+
+		local active, timers = anomalies()
+		local lines, now = {}, os.clock()
+		for room, kind in pairs(active) do
+			local id = room .. "|" .. kind
+			if not seen[id] then
+				seen[id] = now
+				if Toggles.NotifySpawn.Value then
+					Library:Notify({ Title = "Anomaly", Description = roomName(room) .. ": " .. kind, Time = 4 })
+				end
+				if Toggles.Announce.Value then announce(room, kind, timers[room]) end
+			end
+			lines[#lines + 1] = string.format("%s — %s (%ds)", roomName(room), kind, timers[room] or 0)
+			if (Toggles.AutoReport.Value or hunting or tutorialRun) and now - seen[id] >= Options.ReportDelay.Value then
+				task.spawn(report, room, kind)
+			end
+		end
+		for id in pairs(seen) do
+			local room, kind = id:match("^(.-)|(.*)$")
+			if active[room] ~= kind then seen[id] = nil end
+		end
+		table.sort(lines)
+		Library.Labels.AnomalyList:SetText(inRound() and (#lines > 0 and table.concat(lines, "\n") or "No active anomalies.") or "Not in a shift.")
+
+		local color = Options.HighlightColor.Value
+		for _, b in ipairs(buttons(Main.Rooms)) do
+			tint(b, Toggles.HighlightRoom.Value and active[b.Name] and color)
+		end
+		local want = Toggles.HighlightReport.Value and active[currentRoom() or ""]
+		for _, b in ipairs(buttons(Main.AnomalyLog)) do
+			tint(b, want and label(b) == want and color)
+		end
+
+		if Toggles.AutoFarm.Value or hunting or tutorialRun then
+			-- isTransitioning stays true for the whole difficulty prompt
+			local diff = Main:FindFirstChild(Options.FarmDifficulty.Value)
+			if diff and diff.Visible then
+				firesignal(diff.Activated)
+			elseif Main.CheckAnomalies.Visible then
+				-- "review the anomalies from this shift?" (shown under 100%) waits for a choice
+				firesignal(Main.CheckAnomalies.Cancel.Activated)
+			elseif Main.CurrentRoom.Text:find("to continue") then
+				-- upvalue 8 of beginRoundIntro = the "any key pressed" flag its InputBegan handler sets
+				debug.setupvalue(env.beginRoundIntro, 8, true)
+			elseif not tutorialRun and not inRound() and not env.isTransitioning and Main.Start.Visible and now > nextStart then
+				nextStart = now + 5
+				if hunting and not hunterPrepare() then
+					nextStart = os.clock() + 3 -- chapter switch transition
+				elseif label(Main.Start) ~= "Unlock" and label(Main.Start) ~= "Coming Soon" then
+					firesignal(Main.Start.Activated)
+				end
+			end
+		end
+		task.wait(0.25)
+	end
+end)
+
+Library:OnUnload(function()
+	for btn, c in pairs(origColor) do btn.BackgroundColor3 = c end
+	for idx, var in pairs(passes) do env[var] = ownedPass[idx] end
+end)
+
+-- UI settings
+local MenuGroup = Tabs["UI Settings"]:AddLeftGroupbox("Menu", "wrench")
+MenuGroup:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", { Default = "RightShift", NoUI = true, Text = "Menu keybind" })
+MenuGroup:AddButton("Unload", function() Library:Unload() end)
+Library.ToggleKeybind = Options.MenuKeybind
+
+ThemeManager:SetLibrary(Library)
+SaveManager:SetLibrary(Library)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+ThemeManager:SetFolder("Eternal/AnomalyDetected") -- per-game themes: Eternal/<Game>/{themes,settings}
+SaveManager:SetFolder("Eternal/AnomalyDetected")
+SaveManager:BuildConfigSection(Tabs["UI Settings"])
+ThemeManager:ApplyToTab(Tabs["UI Settings"])
+SaveManager:LoadAutoloadConfig()
